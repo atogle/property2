@@ -1,6 +1,7 @@
 /*global $,app,esri,accounting,google*/
 
 app.views.property = function (accountNumber) {
+  var HISTORY_PAGE_SIZE = 5;
   var alreadyGettingOpaData, opaRendered, opaDetailsRendered;
 
   app.hooks.ownerSearchDisclaimer.addClass('hide');
@@ -42,6 +43,43 @@ app.views.property = function (accountNumber) {
     renderSa();
   } else if (history.state.address && !alreadyGettingOpaData) {
     getSaData();
+  }
+
+  if (history.state.realestatetax) {
+    renderRealEstateTax();
+  } else if (history.state.opa) {
+    getRealEstateTaxData();
+  }
+
+  // Bind click event for fancy tax balance pay button
+  app.hooks.payTaxBalanceLink.on('click', function(e) {
+    e.preventDefault();
+
+    var tpl = '<?xml version="1.0" encoding="utf-16"?><BillingStatement xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"><ApplicationID>fcd68fd2-e923-4b03-a0e7-a678c2ed612a</ApplicationID><AccountNumber /><BillNumber>{{account_number}}</BillNumber><StatementNumber /><BillingDate>{{now}}</BillingDate><DueDate>{{now}}</DueDate><TotalDue>{{amount}}</TotalDue><DepartMentId>0</DepartMentId><Fund>0</Fund><PaymentDate>0001-01-01T00:00:00</PaymentDate><Quantity>0</Quantity><ItemAmount>0</ItemAmount><TotalAmountdue>0</TotalAmountdue><PartialPaymentFlag>false</PartialPaymentFlag><ReceiptpresentFlag>false</ReceiptpresentFlag><Details><BillingStatementDetail><ItemDate>{{now}}</ItemDate><ItemDescription>{{description}}</ItemDescription><Charges>{{amount}}</Charges><Credits>0</Credits></BillingStatementDetail></Details><Customers><Customer><FirstName>{{name}}</FirstName><MiddleName /><LastName /><BillingAddress><Address><AddressLine1>{{address}}</AddressLine1><City>{{city}}</City><State>{{state}}</State><PostalCode>{{zip}}</PostalCode><Country>USA</Country></Address></BillingAddress></Customer></Customers></BillingStatement>',
+        xml = app.util.tpl(tpl, getPaymentData());
+
+    // Create imaginary form with the endpoint & the xml data and submit it
+    $('<form/>', {
+      method: 'post',
+      action: 'https://secure.phila.gov/PaymentCenter/Gateway1/InitiatePurchase.aspx'
+    }).append($('<input/>', {
+      name: 'billStmt',
+      val: xml
+    })).submit();
+  });
+
+  function getPaymentData() {
+    return {
+      account_number: history.state.opa.account_number,
+      amount: history.state.realestatetax.balance_totals.total,
+      now: new Date().toISOString(),
+      description: 'Real estate tax for ' + history.state.address,
+      name: history.state.opa.ownership.owners[0],
+      address: history.state.opa.ownership.mailing_address.street,
+      city: history.state.opa.ownership.mailing_address.city,
+      state: history.state.opa.ownership.mailing_address.state,
+      zip: history.state.opa.ownership.mailing_address.zip
+    };
   }
 
   function hasOpaDetails() {
@@ -87,6 +125,53 @@ app.views.property = function (accountNumber) {
       });
   }
 
+  function getRealEstateTaxData () {
+    var state = history.state;
+
+    // Totals do not come back from the API. Calculate them once when the data
+    // is fetched.
+    function addTaxBalanceTotals(data) {
+      var balanceTotals = {
+        tax_period: 'Total', principal: 0, interest: 0, penalty: 0, other: 0, total: 0
+      };
+
+      data.forEach(function (b) {
+        var total = parseFloat(b.total),
+            principal = parseFloat(b.principal),
+            interest = parseFloat(b.interest),
+            penalty = parseFloat(b.penalty),
+            other = parseFloat(b.other);
+
+        // Total for all attributes for all years
+        balanceTotals.total += total;
+        balanceTotals.principal += principal;
+        balanceTotals.interest += interest;
+        balanceTotals.penalty += penalty;
+        balanceTotals.other += other;
+      });
+
+      data.balance_totals = balanceTotals;
+      return data;
+    }
+
+    $.ajax('https://data.phila.gov/resource/y5ti-svsu.json?parcel_number='+state.opa.account_number)
+      .done(function (data) {
+        var state = $.extend({}, history.state);
+
+        state.realestatetax = data;
+        addTaxBalanceTotals(data);
+
+        history.replaceState(state, '');
+        renderRealEstateTax();
+      })
+      .fail(function () {
+        var state = $.extend({}, history.state);
+        state.realestatetax = {error: true};
+        history.replaceState(state, '');
+        renderRealEstateTax();
+      });
+  }
+
   function renderOpa () {
     var state = history.state;
 
@@ -127,6 +212,13 @@ app.views.property = function (accountNumber) {
 
     // Empty valuation history
     app.hooks.valuation.empty();
+
+    // Reset tax balance history
+    app.hooks.taxBalanceStatus.removeClass('hidden').text('Loading...');
+    app.hooks.payTaxBalanceLink.addClass('hidden');
+    app.hooks.taxBalanceHistory.addClass('hidden');
+    app.hooks.totalTaxBalance.empty();
+    app.hooks.taxBalanceHistoryTbody.empty();
 
     app.hooks.content.append(app.hooks.propertyMain);
     app.hooks.content.append(app.hooks.propertySide);
@@ -364,45 +456,61 @@ app.views.property = function (accountNumber) {
     app.hooks.waterPlate.text(sa.water_plate);
   }
 
+  function renderRealEstateTax () {
+    var state = history.state;
+
+    // No use rendering if there's been a data error
+    if (state.error) return;
+
+    if (state.realestatetax.error) {
+      // Empty the total tax balance
+      app.hooks.taxBalanceStatus.removeClass('hidden').text('No tax balance information found.');
+
+      return;
+    }
+
+    // Wait for both OPA render and RET data
+    if (!opaRendered || !state.realestatetax) return;
+
+    // Helper function to append a row
+    function appendTaxBalanceRow(b) {
+      var row = $('<tr>');
+      row.append($('<td>').text(b.tax_period));
+      row.append($('<td>').text(accounting.formatMoney(b.principal, '$', 2)));
+      row.append($('<td>').text(accounting.formatMoney(b.interest, '$', 2)));
+      row.append($('<td>').text(accounting.formatMoney(b.penalty, '$', 2)));
+      row.append($('<td>').text(accounting.formatMoney(b.other, '$', 2)));
+      row.append($('<td>').text(accounting.formatMoney(b.total, '$', 2)));
+      row.append($('<td>').text(b.lien_number || '---'));
+
+      app.hooks.taxBalanceHistoryTbody.append(row);
+    }
+
+    // Sort tax balances in place by year, descending
+    state.realestatetax.sort(function(a, b) { return b.tax_period - a.tax_period; });
+
+    // Show history link
+    app.hooks.taxBalanceStatus.addClass('hidden');
+
+    // Render total balance
+    app.hooks.totalTaxBalance.text(accounting.formatMoney(state.realestatetax.balance_totals.total));
+
+    // Render tax balance history
+    if (state.realestatetax && state.realestatetax.length > 1) {
+      // Render totals if there is more than one row
+      appendTaxBalanceRow(state.realestatetax.balance_totals);
+    }
+    state.realestatetax.forEach(function (b) {
+      appendTaxBalanceRow(b);
+    });
+
+    if (state.realestatetax.balance_totals.total !== 0) {
+      app.hooks.taxBalanceHistory.removeClass('hidden');
+      app.hooks.payTaxBalanceLink.removeClass('hidden');
+    }
+  }
+
   function renderError () {
     // TODO Display an error message that looks nice
   }
-
-  // // TODO Get L&I data
-  // // Tim also pointed at http://api.phila.gov/ULRS311/Data/LIAddressKey/340%20n%2012th%20st
-  // var topicsUrl = 'https://api.phila.gov/ulrs/v3/addresses/' + encodeURIComponent(params.p) + '/topics?format=json';
-  // $.ajax(topicsUrl)
-  //   .done(function (data) {
-  //     var addressKey;
-  //     data.topics.some(function (topic) {
-  //       if (topic.topicName === 'AddressKeys') {
-  //         return topic.keys.some(function (key) {
-  //           if (key.topicId) {
-  //             addressKey = key.topicId;
-  //             return true;
-  //           }
-  //         });
-  //       }
-  //     });
-  //     if (!addressKey) {
-  //       propertyData.li = {error: 'No L&I key found at ' + topicsUrl + '.'};
-  //       return --pending || app.views.address(propertyData);
-  //     }
-  //     $.ajax('https://services.phila.gov/PhillyApi/Data/v1.0/locations(' + addressKey + ')?$format=json')
-  //       .done(function (data) {
-  //         propertyData.li = data.d;
-  //         --pending || app.views.property(propertyData);
-  //       })
-  //       .fail(function () {
-  //         propertyData.li = {error: 'Failed to retrieve L&I address data.'};
-  //         --pending || app.views.property(propertyData);
-  //       });
-  //   })
-  //   .fail(function () {
-  //     propertyData.li = {error: 'Failed to retrieve address topics.'};
-  //     --pending || app.views.property(propertyData);
-  //   });
-  //
-  // function renderLi () {
-  // }
 };
