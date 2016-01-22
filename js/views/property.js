@@ -60,7 +60,7 @@ app.views.property = function (accountNumber) {
         // Create imaginary form with the endpoint & the xml data
         $form = $('<form/>', {
           method: 'post',
-          action: 'https://secure.phila.gov/PaymentCenter/Gateway1/InitiatePurchase.aspx'
+          action: 'https://test-secure.phila.gov/paymentcenter/Gateway1/InitiatePurchase.aspx',
         }).append($('<input/>', {
           name: 'billStmt',
           val: xml
